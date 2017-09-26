@@ -27,12 +27,20 @@
 #define _FDPASSING_H
 
 #include <uuid.h>
+#include <sys/capsicum.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <errno.h>
 
 #define	F_NONE		 0
 #define	F_SHUTDOWN	 1
 
 #define	F_FILE_FEATURE_NONE	 0
 #define	F_FILE_FEATURE_CAP	 1
+
+#define	F_GETADDRINFO_NONE	 0
+#define	F_GETADDRINFO_HINTS	 1
 
 #define	STATUSSZ	 33
 #define	CONTROLSZ	 (sizeof(struct cmsghdr) + sizeof(int) + 16)
@@ -42,7 +50,14 @@ typedef enum _request_type {
 	SHUTDOWN	= 1,
 	CLOSE_FD	= 2,
 	CREATE_SOCKET	= 3,
+	UNLINK_PATH	= 4,
+	GETADDRINFO	= 5,
 } request_type;
+
+typedef enum _response_code {
+	ERROR_NONE	= 0,
+	ERROR_FAIL	= 1,
+} response_code;
 
 struct request_add_file_path {
 	char		 r_path[1024];
@@ -64,22 +79,55 @@ struct request_open_socket {
 	cap_rights_t	 r_rights;
 };
 
+struct request_unlink {
+	char	 r_path[1024];
+};
+
+struct request_getaddrinfo {
+	char		 r_hostname[256];
+	char		 r_servname[256];
+	struct addrinfo	 r_hints;
+	uint64_t	 r_features;
+};
+
 struct request {
 	request_type	 r_type;
 	union {
 		struct request_add_file_path	 u_add_file_path;
 		struct request_open_socket	 u_open_socket;
 		struct request_close_fd		 u_close_fd;
+		struct request_unlink		 u_unlink_path;
+		struct request_getaddrinfo	 u_getaddrinfo;
 	}		 r_payload;
 };
 
+struct response_addrinfo {
+	int	 ra_flags;
+	int	 ra_family;
+	int	 ra_socktype;
+	int	 ra_protocol;
+	union {
+		struct sockaddr_in	 addr4;
+		struct sockaddr_in6	 addr6;
+	}	 ra_sockaddr;
+};
+
 struct response {
-	char	 r_status[STATUSSZ];
-	uuid_t	 r_uuid;
+	response_code	 r_code;
+	int		 r_errno;
+	uuid_t		 r_uuid;
 };
 
 extern int backend_fd;
 
+int sandbox_open(const char *, int, mode_t, cap_rights_t *);
+int sandbox_mkdir(const char *, mode_t);
+int sandbox_unlink(const char *);
+int sandbox_socket(int, int, int, cap_rights_t *);
+int sandbox_getaddrinfo(const char *, const char *,
+    const struct addrinfo *, struct addrinfo **);
+
 void fork_backend(void);
+void sandbox_cleanup(void);
 
 #endif /* !_FDPASSING_H */

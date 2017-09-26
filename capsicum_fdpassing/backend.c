@@ -99,24 +99,34 @@ do_open(struct request *request)
 {
 	struct response *response;
 	struct responses *res;
-	int fd;
+	int fd, flags;
+	mode_t mode;
 
 	response = calloc(1, sizeof(*response));
 	if (response == NULL)
 		return (NULL);
 
-	fd = open(request->r_payload.u_add_file_path.r_path,
-	    request->r_payload.u_add_file_path.r_flags);
+	flags = request->r_payload.u_add_file_path.r_flags;
+	mode = request->r_payload.u_add_file_path.r_mode;
+
+	if ((flags & O_CREAT) == O_CREAT) {
+		fd = open(request->r_payload.u_add_file_path.r_path,
+		    flags, mode);
+	} else {
+		fd = open(request->r_payload.u_add_file_path.r_path,
+		    flags);
+	}
+
 	if (fd != -1 &&
 	    (request->r_payload.u_add_file_path.r_features & F_FILE_FEATURE_CAP)) {
 		cap_rights_limit(fd,
 		    &(request->r_payload.u_add_file_path.r_rights));
-		strlcpy(response->r_status, "OK", sizeof(response->r_status));
 	}
 
 	if (fd == -1) {
 		fd = badf;
-		strlcpy(response->r_status, "FAIL", sizeof(response->r_status));
+		response->r_code = ERROR_FAIL;
+		response->r_errno = errno;
 	}
 
 	uuidgen(&(response->r_uuid), 1);
@@ -145,16 +155,17 @@ do_socket_create(struct request *request)
 	fd = socket(request->r_payload.u_open_socket.r_domain,
 	    request->r_payload.u_open_socket.r_type,
 	    request->r_payload.u_open_socket.r_protocol);
+
 	if (fd != -1 &&
 	    (request->r_payload.u_open_socket.r_features & F_FILE_FEATURE_CAP)) {
 		cap_rights_limit(fd,
 		    &(request->r_payload.u_open_socket.r_rights));
-		strlcpy(response->r_status, "OK", sizeof(response->r_status));
 	}
 
 	if (fd == -1) {
 		fd = badf;
-		strlcpy(response->r_status, "FAIL", sizeof(response->r_status));
+		response->r_code = ERROR_FAIL;
+		response->r_errno = errno;
 	}
 
 	uuidgen(&(response->r_uuid), 1);
@@ -169,13 +180,110 @@ do_socket_create(struct request *request)
 	return (res);
 }
 
+static struct response *
+do_unlink_path(struct request *request)
+{
+	struct response *response;
+	int res;
+
+	response = calloc(1, sizeof(*response));
+	if (response == NULL)
+		return (NULL);
+
+	res = unlink(request->r_payload.u_unlink_path.r_path);
+	if (res) {
+		response->r_code = ERROR_FAIL;
+		response->r_errno = errno;
+	}
+
+	return (response);
+}
+
+static void
+do_getaddrinfo(int fd, struct request *request)
+{
+	struct addrinfo *hints, *iter, *res;
+	struct response_addrinfo *addrinfo_responses;
+	char *host, *servname;
+	size_t i, nresults;
+	int err;
+
+	host = servname = NULL;
+	hints = NULL;
+	res = NULL;
+
+	if (strlen(request->r_payload.u_getaddrinfo.r_hostname))
+		host = request->r_payload.u_getaddrinfo.r_hostname;
+	if (strlen(request->r_payload.u_getaddrinfo.r_servname))
+		servname = request->r_payload.u_getaddrinfo.r_servname;
+	if ((request->r_payload.u_getaddrinfo.r_features & F_GETADDRINFO_HINTS))
+		hints = &(request->r_payload.u_getaddrinfo.r_hints);
+
+	if (host == NULL && servname == NULL) {
+		/* XXX Process error */
+		goto err;
+	}
+
+	err = getaddrinfo(host, servname, hints, &res);
+	if (err) {
+		/* XXX Process error */
+		goto err;
+	}
+
+	iter = res;
+	nresults = 0;
+	while (iter != NULL) {
+		iter = res->ai_next;
+		nresults++;
+	}
+
+	addrinfo_responses = calloc(nresults, sizeof(*responses));
+	if (responses == NULL) {
+		nresults = 0;
+		send(fd, &nresults, sizeof(nresults), 0);
+		goto err;
+	}
+
+	if (send(fd, &nresults, sizeof(nresults), 0) != sizeof(nresults)) {
+		freeaddrinfo(res);
+		nresults = 0;
+		send(fd, &nresults, sizeof(nresults), 0);
+		goto err;
+	}
+
+	for (i=0, iter = res; iter != NULL; iter = iter->ai_next, i++) {
+		addrinfo_responses[i].ra_flags = iter->ai_flags;
+		addrinfo_responses[i].ra_family = iter->ai_family;
+		addrinfo_responses[i].ra_socktype = iter->ai_socktype;
+		addrinfo_responses[i].ra_protocol = iter->ai_protocol;
+
+		switch (iter->ai_family) {
+		case AF_INET:
+			memmove(&(addrinfo_responses[i].ra_sockaddr.addr4),
+			    iter->ai_addr,
+			    sizeof(addrinfo_responses[i].ra_sockaddr.addr4));
+			break;
+		case AF_INET6:
+			memmove(&(addrinfo_responses[i].ra_sockaddr.addr6),
+			    iter->ai_addr,
+			    sizeof(addrinfo_responses[i].ra_sockaddr.addr6));
+			break;
+		}
+	}
+
+	send(fd, responses, sizeof(*addrinfo_responses) * nresults, 0);
+
+err:
+	if (res != NULL)
+		freeaddrinfo(res);
+}
+
 void
 fork_backend(void)
 {
-	char buffer[sizeof(struct request)];
+	struct response response, *responsep;
 	char control[CONTROLSZ];
 	int fd, fdpair[2], newfd;
-	struct response response;
 	struct request request;
 	struct responses *res;
 	struct cmsghdr *cmsg;
@@ -184,7 +292,6 @@ fork_backend(void)
 	struct iovec iov;
 	ssize_t nrecv;
 	pid_t pid;
-	size_t i;
 
 	if (socketpair(PF_UNIX, SOCK_DGRAM, 0, fdpair)) {
 		perror("socketpair");
@@ -234,17 +341,41 @@ fork_backend(void)
 		case CLOSE_FD:
 			close_resource(&(request.r_payload.u_close_fd.r_uuid));
 			break;
+		case UNLINK_PATH:
+			responsep = do_unlink_path(&request);
+			break;
 		case SHUTDOWN:
 			close(fd);
 			_exit(0);
+		case GETADDRINFO:
+			do_getaddrinfo(fd, &request);
+			break;
 		}
 
-		if (request.r_type == CLOSE_FD)
+		if (request.r_type == CLOSE_FD ||
+		    request.r_type == GETADDRINFO)
 			continue;
+
+		if (request.r_type == UNLINK_PATH) {
+			if (responsep == NULL) {
+				/* XXX Ouch */
+				continue;
+			}
+
+			if (send(fd, responsep, sizeof(*responsep), 0) != sizeof(*responsep)) {
+				/* XXX Major ouch */
+				close(fd);
+				exit(0);
+			}
+
+			free(responsep);
+			continue;
+		}
 
 		if (res == NULL) {
 			memset(&response, 0, sizeof(response));
-			strlcpy(response.r_status, "FAIL", sizeof(response.r_status));
+			response.r_code = ERROR_FAIL;
+			response.r_errno = errno;
 			newfd = -1;
 		} else {
 			memmove(&response, res->response, sizeof(response));

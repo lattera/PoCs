@@ -44,24 +44,15 @@ struct response_wrapper {
 	struct response response;
 };
 
-static void
-usage(char *prog)
-{
-	fprintf(stderr, "USAGE: %s [-s] [-f <path>]\n", prog);
-	fprintf(stderr, "    -s:        Create a socket\n");
-	fprintf(stderr, "    -f <path>: Open a file at path <path>\n");
-	exit(0);
-}
-
 static struct response_wrapper *
 send_request(struct request *request)
 {
 	struct response_wrapper *wrapper;
-	struct response response;
 	char control[CONTROLSZ];
 	struct cmsghdr *cmsg;
 	struct msghdr msg;
 	struct iovec iov;
+	ssize_t nrecv;
 
 	wrapper = calloc(1, sizeof(*wrapper));
 	if (wrapper == NULL)
@@ -77,10 +68,23 @@ send_request(struct request *request)
 	}
 
 	switch (request->r_type) {
+	case GETADDRINFO:
+		free(wrapper);
+		return (NULL);
+	case UNLINK_PATH:
+		nrecv = recv(backend_fd, &(wrapper->response),
+		    sizeof(wrapper->response), 0);
+		if (nrecv != sizeof(wrapper->response)) {
+			free(wrapper);
+			return (NULL);
+		}
+		return (wrapper);
 	case CLOSE_FD:
 	case SHUTDOWN:
 		free(wrapper);
 		return (NULL);
+	case ADD_FILE_PATH:
+	case CREATE_SOCKET:
 	default:
 		break;
 	}
@@ -113,27 +117,28 @@ send_request(struct request *request)
 }
 
 static struct response_wrapper *
-open_file(char *path)
+open_file(const char *path, int flags, mode_t mode, cap_rights_t *rights)
 {
 	struct response_wrapper *wrapper;
 	struct request request;
-	int fd;
 
 	memset(&request, 0, sizeof(request));
 
 	strlcpy(request.r_payload.u_add_file_path.r_path, path,
 	    sizeof(request.r_payload.u_add_file_path.r_path));
-	request.r_payload.u_add_file_path.r_flags = O_RDONLY;
-	request.r_payload.u_add_file_path.r_features |= F_FILE_FEATURE_CAP;
-	cap_rights_init(&(request.r_payload.u_add_file_path.r_rights),
-	    CAP_READ, CAP_FCNTL);
+	if (rights != NULL) {
+		request.r_payload.u_add_file_path.r_features |= F_FILE_FEATURE_CAP;
+		memcpy(&(request.r_payload.u_add_file_path.r_rights), rights,
+		    sizeof(request.r_payload.u_add_file_path.r_rights));
+	}
 
 	wrapper = send_request(&request);
 	return (wrapper);
 }
 
 static struct response_wrapper *
-create_socket(void)
+create_socket(int domain, int type, int protocol,
+    cap_rights_t *rights)
 {
 	struct response_wrapper *wrapper;
 	struct request request;
@@ -141,11 +146,15 @@ create_socket(void)
 
 	memset(&request, 0, sizeof(request));
 
-	request.r_payload.u_open_socket.r_domain = PF_INET;
-	request.r_payload.u_open_socket.r_type = SOCK_STREAM;
-	request.r_payload.u_open_socket.r_features |= F_FILE_FEATURE_CAP;
-	cap_rights_init(&(request.r_payload.u_open_socket.r_rights),
-	    CAP_READ, CAP_WRITE, CAP_CONNECT, CAP_EVENT);
+	request.r_type = CREATE_SOCKET;
+	request.r_payload.u_open_socket.r_domain = domain;
+	request.r_payload.u_open_socket.r_type = type;
+	request.r_payload.u_open_socket.r_protocol = protocol;
+	if (rights != NULL) {
+		request.r_payload.u_open_socket.r_features |= F_FILE_FEATURE_CAP;
+		memcpy(&(request.r_payload.u_open_socket.r_rights), rights,
+		    sizeof(request.r_payload.u_open_socket.r_rights));
+	}
 
 	wrapper = send_request(&request);
 	return (wrapper);
@@ -177,59 +186,203 @@ void shutdown_backend(void)
 }
 
 int
-main(int argc, char *argv[])
+sandbox_open(const char *path, int flags, mode_t mode,
+    cap_rights_t *rights)
 {
 	struct response_wrapper *wrapper;
-	char buf[1024], *p;
-	int ch, fd, i;
-	FILE *fp;
+	int fd;
 
-	fork_backend();
-	cap_enter();
+	fd = -1;
+	wrapper = open_file(path, flags, mode, rights);
+	if (wrapper == NULL)
+		goto end;
+	fd = wrapper->fd;
 
-	while ((ch = getopt(argc, argv, "hsf:")) != -1) {
-		switch (ch) {
-		case 's':
-			wrapper = create_socket();
-			if (wrapper == NULL)
-				continue;
-
-			close_fd(&(wrapper->response.r_uuid));
-
-			fd = wrapper->fd;
-
-			printf("Opened a socket. fd is %d\n", fd);
-			close(fd);
-			free(wrapper);
-			break;
-		case 'f':
-			wrapper = open_file(optarg);
-			if (wrapper == NULL)
-				continue;
-
-			close_fd(&(wrapper->response.r_uuid));
-
-			fd = wrapper->fd;
-			fp = fdopen(fd, "r");
-			if (fp == NULL) {
-				perror("fdopen");
-				close(fd);
-				continue;
-			}
-
-			while (fgets(buf, sizeof(buf), fp))
-				printf("%s", buf);
-
-			close(fd);
-			free(wrapper);
-			break;
-		default:
-			shutdown_backend();
-			usage(argv[0]);
-		}
+	if (wrapper->response.r_code != ERROR_NONE) {
+		fd = -1;
+		errno = wrapper->response.r_errno;
 	}
 
 end:
+	if (wrapper != NULL) {
+		if (fd != -1)
+			close_fd(&(wrapper->response.r_uuid));
+		free(wrapper);
+	}
+
+	return (fd);
+}
+
+int
+sandbox_unlink(const char *path)
+{
+	struct response_wrapper *wrapper;
+	struct request request;
+	int res;
+
+	memset(&request, 0, sizeof(request));
+
+	request.r_type = UNLINK_PATH;
+	strlcpy(request.r_payload.u_unlink_path.r_path, path,
+	    sizeof(request.r_payload.u_unlink_path.r_path));
+
+	wrapper = send_request(&request);
+	if (wrapper == NULL)
+		return (0);
+
+	res = wrapper->response.r_code;
+	if (res == ERROR_FAIL)
+		errno = wrapper->response.r_errno;
+
+	free(wrapper);
+	return (res == ERROR_FAIL ? -1 : 0);
+}
+
+int
+sandbox_socket(int domain, int type, int protocol,
+    cap_rights_t *rights)
+{
+	struct response_wrapper *wrapper;
+	int fd;
+
+	wrapper = create_socket(domain, type, protocol, rights);
+	if (wrapper == NULL)
+		return (-1);
+
+	fd = wrapper->fd;
+
+	if (wrapper->response.r_code != ERROR_NONE) {
+		fd = -1;
+		errno = wrapper->response.r_errno;
+	}
+
+	close_fd(&(wrapper->response.r_uuid));
+
+	free(wrapper);
+	return (fd);
+}
+
+
+int
+sandbox_getaddrinfo(const char *name, const char *servname,
+    const struct addrinfo *hints,
+    struct addrinfo **res)
+{
+	struct response_addrinfo *responses;
+	struct request request;
+	struct addrinfo *next, *p;
+	size_t i, nresults;
+	int retval;
+
+	if (name == NULL && servname == NULL)
+		return (-1);
+
+	retval = 0;
+	memset(&request, 0, sizeof(request));
+	request.r_type = GETADDRINFO;
+	if (hints != NULL) {
+		memmove(&(request.r_payload.u_getaddrinfo.r_hints),
+		    hints,
+		    sizeof(request.r_payload.u_getaddrinfo.r_hints));
+		request.r_payload.u_getaddrinfo.r_features |= F_GETADDRINFO_HINTS;
+	}
+
+	if (name != NULL) {
+		strlcpy(request.r_payload.u_getaddrinfo.r_hostname,
+		    name,
+		    sizeof(request.r_payload.u_getaddrinfo.r_hostname));
+	}
+
+	if (servname != NULL) {
+		strlcpy(request.r_payload.u_getaddrinfo.r_servname,
+		    servname,
+		    sizeof(request.r_payload.u_getaddrinfo.r_servname));
+	}
+
+	if (send(backend_fd, &request, sizeof(request), 0) != sizeof(request)) {
+		retval = -1;
+		goto end;
+	}
+
+	nresults = 0;
+	if (recv(backend_fd, &nresults, sizeof(nresults), 0) != sizeof(nresults)) {
+		retval = -1;
+		goto end;
+	}
+
+	if (nresults == 0) {
+		retval = -1;
+		goto end;
+	}
+
+	responses = calloc(nresults, sizeof(*responses));
+	if (responses == NULL) {
+		/* XXX we still have data to recv... Fix this... */
+		retval = -1;
+		goto end;
+	}
+
+	if (recv(backend_fd, responses, sizeof(*responses) * nresults, 0)
+	!= sizeof(*responses) * nresults) {
+		retval = -1;
+		goto end;
+	}
+
+	*res = calloc(1, sizeof(struct addrinfo));
+	if (*res == NULL) {
+		retval = -1;
+		goto end;
+	}
+
+	p = *res;
+	for (i=0; i < nresults; i++) {
+		p->ai_flags = responses[i].ra_flags;
+		p->ai_family = responses[i].ra_family;
+		p->ai_socktype = responses[i].ra_socktype;
+		p->ai_protocol = responses[i].ra_protocol;
+
+		switch (p->ai_family) {
+		case AF_INET:
+			p->ai_addrlen = sizeof(struct sockaddr_in);
+			p->ai_addr = malloc(p->ai_addrlen);
+			if (p->ai_addr == NULL) {
+				/* XXX Handle this */
+				retval = -1;
+				goto end;
+			}
+			memmove(p->ai_addr, &(responses[i].ra_sockaddr.addr4),
+				p->ai_addrlen);
+			break;
+		case AF_INET6:
+			p->ai_addrlen = sizeof(struct sockaddr_in6);
+			p->ai_addr = malloc(p->ai_addrlen);
+			if (p->ai_addr == NULL) {
+				/* XXX Handle this */
+				retval = -1;
+				goto end;
+			}
+			memmove(p->ai_addr, &(responses[i].ra_sockaddr.addr6),
+				p->ai_addrlen);
+			break;
+		}
+
+		next = calloc(1, sizeof(struct addrinfo));
+		if (next == NULL) {
+			/* XXX Handle this */
+			retval = -1;
+			goto end;
+		}
+
+		p->ai_next = next;
+		p = next;
+	}
+
+end:
+	return (retval);
+}
+
+void
+sandbox_cleanup(void)
+{
 	shutdown_backend();
-	return (0);
 }
