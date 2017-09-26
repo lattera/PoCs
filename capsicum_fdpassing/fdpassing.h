@@ -119,6 +119,7 @@ struct response {
 };
 
 extern int backend_fd;
+extern int childpid;
 
 int sandbox_open(const char *, int, mode_t, cap_rights_t *);
 int sandbox_mkdir(const char *, mode_t);

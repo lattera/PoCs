@@ -46,6 +46,58 @@ usage(char *prog)
 	exit(0);
 }
 
+static void
+sighandler(int signo)
+{
+	sandbox_cleanup();
+	printf("Killing pid %d\n", childpid);
+	kill(childpid, SIGINT);
+	waitpid(childpid, NULL, 0);
+	exit(0);
+}
+
+static void
+handle_socket(char *arg)
+{
+	struct addrinfo hints, *res;
+	cap_rights_t rights;
+	char *port;
+	int fd;
+
+	port = strchr(arg, ':');
+	if (port != NULL)
+		*port++ = '\0';
+	else
+		port = "22";
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+
+	if (sandbox_getaddrinfo(arg, port, &hints, &res)) {
+		perror("getaddrinfo");
+		return;
+	}
+
+	cap_rights_init(&rights, CAP_CONNECT, CAP_GETPEERNAME,
+	    CAP_RECV, CAP_SEND, CAP_SETSOCKOPT, CAP_SHUTDOWN,
+	    CAP_GETSOCKNAME, CAP_PEELOFF);
+
+	fd = sandbox_socket(res->ai_family, res->ai_socktype,
+	    res->ai_protocol, &rights);
+	if (fd == -1) {
+		perror("sandbox_socket");
+		return;
+	}
+
+	if (connect(fd, res->ai_addr, res->ai_addrlen)) {
+		perror("connect");
+		return;
+	}
+
+	close(fd);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -57,18 +109,12 @@ main(int argc, char *argv[])
 	fork_backend();
 	cap_enter();
 
-	while ((ch = getopt(argc, argv, "hsf:")) != -1) {
+	signal(SIGINT, sighandler);
+
+	while ((ch = getopt(argc, argv, "hf:s:")) != -1) {
 		switch (ch) {
 		case 's':
-			fd = sandbox_socket(PF_INET, SOCK_STREAM, 0, NULL);
-			if (fd == -1) {
-				perror("sandbox_socket");
-				break;
-			}
-
-			printf("Opened a socket. fd is %d\n", fd);
-			close(fd);
-			free(wrapper);
+			handle_socket(optarg);
 			break;
 		case 'f':
 			fd = sandbox_open(optarg, O_RDONLY, 0, NULL);

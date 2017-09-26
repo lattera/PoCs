@@ -38,6 +38,7 @@
 #include "fdpassing.h"
 
 int backend_fd;
+int childpid;
 
 struct response_wrapper {
 	int fd;
@@ -318,6 +319,7 @@ sandbox_getaddrinfo(const char *name, const char *servname,
 	responses = calloc(nresults, sizeof(*responses));
 	if (responses == NULL) {
 		/* XXX we still have data to recv... Fix this... */
+		perror("parent calloc");
 		retval = -1;
 		goto end;
 	}

@@ -220,6 +220,7 @@ do_getaddrinfo(int fd, struct request *request)
 		hints = &(request->r_payload.u_getaddrinfo.r_hints);
 
 	if (host == NULL && servname == NULL) {
+		printf("Child: Both host and servname cannot be null\n");
 		/* XXX Process error */
 		goto err;
 	}
@@ -227,18 +228,20 @@ do_getaddrinfo(int fd, struct request *request)
 	err = getaddrinfo(host, servname, hints, &res);
 	if (err) {
 		/* XXX Process error */
+		perror("child getaddrinfo");
 		goto err;
 	}
 
 	iter = res;
 	nresults = 0;
 	while (iter != NULL) {
-		iter = res->ai_next;
+		iter = iter->ai_next;
 		nresults++;
 	}
 
 	addrinfo_responses = calloc(nresults, sizeof(*responses));
-	if (responses == NULL) {
+	if (addrinfo_responses == NULL) {
+		perror("Child calloc");
 		nresults = 0;
 		send(fd, &nresults, sizeof(nresults), 0);
 		goto err;
@@ -271,7 +274,7 @@ do_getaddrinfo(int fd, struct request *request)
 		}
 	}
 
-	send(fd, responses, sizeof(*addrinfo_responses) * nresults, 0);
+	send(fd, addrinfo_responses, sizeof(*addrinfo_responses) * nresults, 0);
 
 err:
 	if (res != NULL)
@@ -310,6 +313,7 @@ fork_backend(void)
 		daemon(0, 1);
 		break;
 	default:
+		childpid = pid;
 		cap_rights_init(&rights, CAP_READ, CAP_WRITE);
 		backend_fd = fdpair[0];
 		cap_rights_limit(backend_fd, &rights);
