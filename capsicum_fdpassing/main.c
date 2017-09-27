@@ -63,6 +63,7 @@ handle_socket(char *arg)
 	cap_rights_t rights;
 	char *port;
 	int fd;
+	char ch;
 
 	port = strchr(arg, ':');
 	if (port != NULL)
@@ -90,9 +91,14 @@ handle_socket(char *arg)
 		return;
 	}
 
-	if (connect(fd, res->ai_addr, res->ai_addrlen)) {
+	if (sandbox_connect(fd, res->ai_addr, res->ai_addrlen)) {
 		perror("connect");
 		return;
+	}
+
+	while (recv(fd, &ch, 1, 0) == 1) {
+		putc((int)ch, stdout);
+		fflush(stdout);
 	}
 
 	close(fd);

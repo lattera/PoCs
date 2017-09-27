@@ -45,6 +45,66 @@ struct response_wrapper {
 	struct response response;
 };
 
+static struct uuids {
+	int active;
+	int fd;
+	uuid_t uuid;
+} *uuids;
+
+static size_t nuuids;
+
+static struct uuids *
+add_uuid(int fd, uuid_t *uuid)
+{
+	size_t i;
+	void *p;
+
+	printf("Adding fd %d to uuids\n", fd);
+
+	for (i = 0; i < nuuids; i++) {
+		if (uuids[i].active == 0) {
+			uuids[i].active = 1;
+			uuids[i].fd = fd;
+			memmove(&(uuids[i].uuid), uuid,
+			    sizeof(uuids[i].uuid));
+			return (&(uuids[i]));
+		}
+	}
+
+	p = realloc(uuids, sizeof(struct uuids) *
+	    (nuuids + 1));
+	if (p == NULL)
+		return (NULL);
+
+	uuids = p;
+	uuids[nuuids].active = 1;
+	uuids[nuuids].fd = fd;
+	memmove(&(uuids[i].uuid), uuid, sizeof(uuids[i].uuid));
+	nuuids++;
+
+	printf("Added fd %d to uuids. Total fds %zu.\n", fd, nuuids);
+
+	return (&(uuids[nuuids-1]));
+}
+
+static struct uuids *
+lookup_uuid(int fd)
+{
+	size_t i;
+
+	printf("Looking up fd %d\n", fd);
+
+	for (i = 0; i < nuuids; i++) {
+		if (uuids[i].active == 0)
+			continue;
+
+		if (uuids[i].fd == fd)
+			return (&(uuids[i]));
+	}
+
+	return (NULL);
+}
+
 static struct response_wrapper *
 send_request(struct request *request)
 {
@@ -72,6 +132,7 @@ send_request(struct request *request)
 	case GETADDRINFO:
 		free(wrapper);
 		return (NULL);
+	case CONNECT_SOCKET:
 	case UNLINK_PATH:
 		nrecv = recv(backend_fd, &(wrapper->response),
 		    sizeof(wrapper->response), 0);
@@ -134,6 +195,8 @@ open_file(const char *path, int flags, mode_t mode, cap_rights_t *rights)
 	}
 
 	wrapper = send_request(&request);
+	if (wrapper != NULL && wrapper->response.r_code == ERROR_NONE)
+		add_uuid(wrapper->fd, &(wrapper->response.r_uuid));
 	return (wrapper);
 }
 
@@ -158,6 +221,8 @@ create_socket(int domain, int type, int protocol,
 	}
 
 	wrapper = send_request(&request);
+	if (wrapper != NULL && wrapper->response.r_code == ERROR_NONE)
+		add_uuid(wrapper->fd, &(wrapper->response.r_uuid));
 	return (wrapper);
 }
 
@@ -257,7 +322,7 @@ sandbox_socket(int domain, int type, int protocol,
 		errno = wrapper->response.r_errno;
 	}
 
-	close_fd(&(wrapper->response.r_uuid));
+	//close_fd(&(wrapper->response.r_uuid));
 
 	free(wrapper);
 	return (fd);
@@ -381,6 +446,58 @@ sandbox_getaddrinfo(const char *name, const char *servname,
 
 end:
 	return (retval);
+}
+
+int
+sandbox_connect(int sockfd, struct sockaddr *name, socklen_t namelen)
+{
+	struct response_wrapper *wrapper;
+	struct request request;
+	struct uuids *uuid;
+	int res;
+
+	uuid = lookup_uuid(sockfd);
+	if (uuid == NULL) {
+		printf("Could not find the uuid\n");
+		errno = EBADF;
+		return (-1);
+	}
+
+	memset(&request, 0, sizeof(request));
+	request.r_type = CONNECT_SOCKET;
+	request.r_payload.u_connect.r_socklen = namelen;
+	switch (namelen) {
+	case sizeof(struct sockaddr_in):
+		memmove(&(request.r_payload.u_connect.r_sock.addr4),
+		    name,
+		    sizeof(request.r_payload.u_connect.r_sock.addr4));
+		break;
+	case sizeof(struct sockaddr_in6):
+		memmove(&(request.r_payload.u_connect.r_sock.addr6),
+		    name,
+		    sizeof(request.r_payload.u_connect.r_sock.addr6));
+		break;
+	default:
+		printf("parent lolwut: %u\n", namelen);
+	}
+	memmove(&(request.r_payload.u_connect.r_uuid),
+	    &(uuid->uuid),
+	    sizeof(request.r_payload.u_connect.r_uuid));
+
+	wrapper = send_request(&request);
+	if (wrapper == NULL) {
+		errno = EBADF;
+		return (-1);
+	}
+
+	if (wrapper->response.r_code != ERROR_NONE) {
+		errno = wrapper->response.r_errno;
+		free(wrapper);
+		return (-1);
+	}
+
+	free(wrapper);
+	return (0);
 }
 
 void

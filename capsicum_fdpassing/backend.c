@@ -75,8 +75,8 @@ add_response(int fd, struct response *response)
 	return (&(responses[nresponses-1]));
 }
 
-static void
-close_resource(uuid_t *uuid)
+static struct responses *
+lookup_response(uuid_t *uuid)
 {
 	size_t i;
 
@@ -85,12 +85,24 @@ close_resource(uuid_t *uuid)
 			continue;
 
 		if (uuid_equal(uuid, &(responses[i].response->r_uuid), NULL)) {
-			if (responses[i].fd != badf)
-				close(responses[i].fd);
-			free(responses[i].response);
-			memset(&responses[i], 0, sizeof(*responses));
-			return;
+			return (&responses[i]);
 		}
+	}
+
+	return (NULL);
+}
+
+static void
+close_resource(uuid_t *uuid)
+{
+	struct responses *r;
+
+	r = lookup_response(uuid);
+	if (r != NULL) {
+		if (r->fd != badf)
+			close(r->fd);
+		free(r->response);
+		memset(r, 0, sizeof(*r));
 	}
 }
 
@@ -175,6 +187,53 @@ do_socket_create(struct request *request)
 		memset(response, 0, sizeof(*response));
 		free(response);
 		return (NULL);
+	}
+
+	return (res);
+}
+
+static struct response *
+do_connect(struct request *request)
+{
+	struct response *res;
+	struct responses *r;
+	struct sockaddr *p;
+	int conres;
+
+	res = calloc(1, sizeof(*res));
+	if (res == NULL)
+		return (NULL);
+
+	r = lookup_response(&(request->r_payload.u_connect.r_uuid));
+	if (r == NULL) {
+		printf("Child: Could not lookup descriptor\n");
+		res->r_code = ERROR_FAIL;
+		res->r_errno = EBADF;
+		return (res);
+	}
+
+	/* XXX Yeah, this sucks horribly */
+	conres = -1;
+	switch (request->r_payload.u_connect.r_socklen) {
+	case sizeof(struct sockaddr_in):
+		conres = connect(r->fd,
+		    (const struct sockaddr *)(&(request->r_payload.u_connect.r_sock.addr4)),
+		    request->r_payload.u_connect.r_socklen);
+		break;
+	case sizeof(struct sockaddr_in6):
+		conres = connect(r->fd,
+		    (const struct sockaddr *)(&(request->r_payload.u_connect.r_sock.addr6)),
+		    request->r_payload.u_connect.r_socklen);
+		break;
+	default:
+		printf("blargh: %zu!\n", request->r_payload.u_connect.r_socklen);
+	}
+
+	if (conres == -1) {
+		perror("child connect");
+		res->r_code = ERROR_FAIL;
+		res->r_errno = EBADF;
+		return (res);
 	}
 
 	return (res);
@@ -342,6 +401,9 @@ fork_backend(void)
 		case CREATE_SOCKET:
 			res = do_socket_create(&request);
 			break;
+		case CONNECT_SOCKET:
+			responsep = do_connect(&request);
+			break;
 		case CLOSE_FD:
 			close_resource(&(request.r_payload.u_close_fd.r_uuid));
 			break;
@@ -359,6 +421,15 @@ fork_backend(void)
 		if (request.r_type == CLOSE_FD ||
 		    request.r_type == GETADDRINFO)
 			continue;
+
+		if (request.r_type == CONNECT_SOCKET) {
+			if (res == NULL)
+				continue;
+
+			send(fd, responsep, sizeof(*responsep), 0);
+			free(responsep);
+			continue;
+		}
 
 		if (request.r_type == UNLINK_PATH) {
 			if (responsep == NULL) {

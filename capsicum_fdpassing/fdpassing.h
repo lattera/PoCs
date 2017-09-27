@@ -52,6 +52,7 @@ typedef enum _request_type {
 	CREATE_SOCKET	= 3,
 	UNLINK_PATH	= 4,
 	GETADDRINFO	= 5,
+	CONNECT_SOCKET	= 6,
 } request_type;
 
 typedef enum _response_code {
@@ -79,6 +80,15 @@ struct request_open_socket {
 	cap_rights_t	 r_rights;
 };
 
+struct request_connect_socket {
+	uuid_t		 r_uuid;
+	socklen_t	 r_socklen;
+	union {
+		struct sockaddr_in	 addr4;
+		struct sockaddr_in6	 addr6;
+	}		 r_sock;
+};
+
 struct request_unlink {
 	char	 r_path[1024];
 };
@@ -98,6 +108,7 @@ struct request {
 		struct request_close_fd		 u_close_fd;
 		struct request_unlink		 u_unlink_path;
 		struct request_getaddrinfo	 u_getaddrinfo;
+		struct request_connect_socket	 u_connect;
 	}		 r_payload;
 };
 
@@ -127,6 +138,7 @@ int sandbox_unlink(const char *);
 int sandbox_socket(int, int, int, cap_rights_t *);
 int sandbox_getaddrinfo(const char *, const char *,
     const struct addrinfo *, struct addrinfo **);
+int sandbox_connect(int, struct sockaddr *, socklen_t);
 
 void fork_backend(void);
 void sandbox_cleanup(void);
