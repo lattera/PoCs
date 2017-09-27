@@ -189,7 +189,7 @@ open_file(const char *path, int flags, mode_t mode, cap_rights_t *rights)
 	strlcpy(request.r_payload.u_add_file_path.r_path, path,
 	    sizeof(request.r_payload.u_add_file_path.r_path));
 	if (rights != NULL) {
-		request.r_payload.u_add_file_path.r_features |= F_FILE_FEATURE_CAP;
+		request.r_payload.u_add_file_path.r_features |= F_FEATURE_CAP;
 		memcpy(&(request.r_payload.u_add_file_path.r_rights), rights,
 		    sizeof(request.r_payload.u_add_file_path.r_rights));
 	}
@@ -215,7 +215,7 @@ create_socket(int domain, int type, int protocol,
 	request.r_payload.u_open_socket.r_type = type;
 	request.r_payload.u_open_socket.r_protocol = protocol;
 	if (rights != NULL) {
-		request.r_payload.u_open_socket.r_features |= F_FILE_FEATURE_CAP;
+		request.r_payload.u_open_socket.r_features |= F_FEATURE_CAP;
 		memcpy(&(request.r_payload.u_open_socket.r_rights), rights,
 		    sizeof(request.r_payload.u_open_socket.r_rights));
 	}

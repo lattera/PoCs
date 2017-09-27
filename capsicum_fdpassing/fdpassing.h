@@ -36,8 +36,8 @@
 #define	F_NONE		 0
 #define	F_SHUTDOWN	 1
 
-#define	F_FILE_FEATURE_NONE	 0
-#define	F_FILE_FEATURE_CAP	 1
+#define	F_FEATURE_NONE	 0
+#define	F_FEATURE_CAP	 1
 
 #define	F_GETADDRINFO_NONE	 0
 #define	F_GETADDRINFO_HINTS	 1

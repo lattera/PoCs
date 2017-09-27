@@ -37,6 +37,55 @@
 
 #include "fdpassing.h"
 
+typedef enum _callback_result {
+	CB_TERMINATE	= 0,
+	CB_CONTINUE	= 1,
+} callback_result;
+
+typedef callback_result (*callback)(int, struct request *);
+
+static callback_result do_add_file_path(int, struct request *);
+static callback_result do_getaddrinfo(int, struct request *);
+static callback_result do_unlink_path(int, struct request *);
+static callback_result do_socket_create(int, struct request *);
+static callback_result do_connect(int, struct request *);
+static callback_result do_shutdown(int, struct request *);
+static callback_result do_close(int, struct request *);
+
+static struct callback {
+	request_type	c_type;
+	callback	c_callback;
+} callbacks[] = {
+	{
+		ADD_FILE_PATH,
+		do_add_file_path
+	},
+	{
+		GETADDRINFO,
+		do_getaddrinfo
+	},
+	{
+		UNLINK_PATH,
+		do_unlink_path
+	},
+	{
+		CREATE_SOCKET,
+		do_socket_create
+	},
+	{
+		CONNECT_SOCKET,
+		do_connect
+	},
+	{
+		SHUTDOWN,
+		do_shutdown
+	},
+	{
+		CLOSE_FD,
+		do_close
+	}
+};
+
 static struct responses {
 	int active;
 	int fd;
@@ -106,8 +155,101 @@ close_resource(uuid_t *uuid)
 	}
 }
 
-static struct responses *
-do_open(struct request *request)
+void
+fork_backend(void)
+{
+	int breakout, fd, fdpair[2];
+	struct request request;
+	cap_rights_t rights;
+	pid_t pid;
+	size_t i;
+
+	if (socketpair(PF_UNIX, SOCK_DGRAM, 0, fdpair)) {
+		perror("socketpair");
+		exit(1);
+	}
+
+	pid = fork();
+	switch (pid) {
+	case -1:
+		perror("fork");
+		exit(1);
+	case 0:
+		badf = open("/dev/null", O_RDONLY);
+		cap_rights_init(&rights);
+		cap_rights_limit(badf, &rights);
+		close(fdpair[0]);
+		fd = fdpair[1];
+		daemon(0, 1);
+		break;
+	default:
+		childpid = pid;
+		cap_rights_init(&rights, CAP_READ, CAP_WRITE);
+		backend_fd = fdpair[0];
+		cap_rights_limit(backend_fd, &rights);
+		close(fdpair[1]);
+		return;
+	}
+
+	while (1) {
+		memset(&request, 0, sizeof(request));
+		if (recv(fd, &request, sizeof(request), 0) != sizeof(request))
+			break;
+
+		breakout = 0;
+		for (i = 0; i < sizeof(callbacks) / sizeof(struct callback); i++) {
+			if (callbacks[i].c_type == request.r_type) {
+				switch (callbacks[i].c_callback(fd, &request)) {
+				case CB_TERMINATE:
+					breakout = 1;
+					break;
+				default:
+					break;
+				}
+			}
+
+			if (breakout)
+				break;
+		}
+	}
+
+	close(fd);
+	_exit(0);
+}
+
+static void
+send_file_descriptor(int fd, struct responses *res)
+{
+	char control[CONTROLSZ];
+	struct cmsghdr *cmsg;
+	struct msghdr msg;
+	struct iovec iov;
+
+	memset(&iov, 0, sizeof(iov));
+	memset(&msg, 0, sizeof(msg));
+
+	iov.iov_base = res->response;
+	iov.iov_len = sizeof(*(res->response));
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = control;
+	msg.msg_controllen = sizeof(control);
+
+	cmsg = CMSG_FIRSTHDR(&msg);
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type = SCM_RIGHTS;
+	cmsg->cmsg_len = CMSG_LEN(sizeof(res->fd));
+	memmove(CMSG_DATA(cmsg), &(res->fd), sizeof(res->fd));
+	msg.msg_controllen = cmsg->cmsg_len;
+
+	if (sendmsg(fd, &msg, 0) < 0) {
+		perror("sendmsg");
+		_exit(0);
+	}
+}
+
+static callback_result
+do_add_file_path(int commfd, struct request *request)
 {
 	struct response *response;
 	struct responses *res;
@@ -116,7 +258,7 @@ do_open(struct request *request)
 
 	response = calloc(1, sizeof(*response));
 	if (response == NULL)
-		return (NULL);
+		return (CB_TERMINATE);
 
 	flags = request->r_payload.u_add_file_path.r_flags;
 	mode = request->r_payload.u_add_file_path.r_mode;
@@ -130,7 +272,7 @@ do_open(struct request *request)
 	}
 
 	if (fd != -1 &&
-	    (request->r_payload.u_add_file_path.r_features & F_FILE_FEATURE_CAP)) {
+	    (request->r_payload.u_add_file_path.r_features & F_FEATURE_CAP)) {
 		cap_rights_limit(fd,
 		    &(request->r_payload.u_add_file_path.r_rights));
 	}
@@ -147,118 +289,34 @@ do_open(struct request *request)
 		close(fd);
 		memset(response, 0, sizeof(*response));
 		free(response);
-		return (NULL);
+		return (CB_TERMINATE);
 	}
 
-	return (res);
+	send_file_descriptor(commfd, res);
+
+	return (CB_TERMINATE);
 }
 
-static struct responses *
-do_socket_create(struct request *request)
+static callback_result
+do_unlink_path(int fd, struct request *request)
 {
-	struct response *response;
-	struct responses *res;
-	int fd;
-
-	response = calloc(1, sizeof(*response));
-	if (response == NULL)
-		return (NULL);
-
-	fd = socket(request->r_payload.u_open_socket.r_domain,
-	    request->r_payload.u_open_socket.r_type,
-	    request->r_payload.u_open_socket.r_protocol);
-
-	if (fd != -1 &&
-	    (request->r_payload.u_open_socket.r_features & F_FILE_FEATURE_CAP)) {
-		cap_rights_limit(fd,
-		    &(request->r_payload.u_open_socket.r_rights));
-	}
-
-	if (fd == -1) {
-		fd = badf;
-		response->r_code = ERROR_FAIL;
-		response->r_errno = errno;
-	}
-
-	uuidgen(&(response->r_uuid), 1);
-	res = add_response(fd, response);
-	if (res == NULL) {
-		close(fd);
-		memset(response, 0, sizeof(*response));
-		free(response);
-		return (NULL);
-	}
-
-	return (res);
-}
-
-static struct response *
-do_connect(struct request *request)
-{
-	struct response *res;
-	struct responses *r;
-	struct sockaddr *p;
-	int conres;
-
-	res = calloc(1, sizeof(*res));
-	if (res == NULL)
-		return (NULL);
-
-	r = lookup_response(&(request->r_payload.u_connect.r_uuid));
-	if (r == NULL) {
-		printf("Child: Could not lookup descriptor\n");
-		res->r_code = ERROR_FAIL;
-		res->r_errno = EBADF;
-		return (res);
-	}
-
-	/* XXX Yeah, this sucks horribly */
-	conres = -1;
-	switch (request->r_payload.u_connect.r_socklen) {
-	case sizeof(struct sockaddr_in):
-		conres = connect(r->fd,
-		    (const struct sockaddr *)(&(request->r_payload.u_connect.r_sock.addr4)),
-		    request->r_payload.u_connect.r_socklen);
-		break;
-	case sizeof(struct sockaddr_in6):
-		conres = connect(r->fd,
-		    (const struct sockaddr *)(&(request->r_payload.u_connect.r_sock.addr6)),
-		    request->r_payload.u_connect.r_socklen);
-		break;
-	default:
-		printf("blargh: %zu!\n", request->r_payload.u_connect.r_socklen);
-	}
-
-	if (conres == -1) {
-		perror("child connect");
-		res->r_code = ERROR_FAIL;
-		res->r_errno = EBADF;
-		return (res);
-	}
-
-	return (res);
-}
-
-static struct response *
-do_unlink_path(struct request *request)
-{
-	struct response *response;
+	struct response response;
 	int res;
 
-	response = calloc(1, sizeof(*response));
-	if (response == NULL)
-		return (NULL);
+	memset(&response, 0, sizeof(response));
 
 	res = unlink(request->r_payload.u_unlink_path.r_path);
 	if (res) {
-		response->r_code = ERROR_FAIL;
-		response->r_errno = errno;
+		response.r_code = ERROR_FAIL;
+		response.r_errno = errno;
 	}
 
-	return (response);
+	send(fd, &response, sizeof(response), 0);
+
+	return (CB_TERMINATE);
 }
 
-static void
+static callback_result
 do_getaddrinfo(int fd, struct request *request)
 {
 	struct addrinfo *hints, *iter, *res;
@@ -338,144 +396,104 @@ do_getaddrinfo(int fd, struct request *request)
 err:
 	if (res != NULL)
 		freeaddrinfo(res);
+
+	return (CB_TERMINATE);
 }
 
-void
-fork_backend(void)
+static callback_result
+do_socket_create(int commfd, struct request *request)
 {
-	struct response response, *responsep;
-	char control[CONTROLSZ];
-	int fd, fdpair[2], newfd;
-	struct request request;
+	struct response *response;
 	struct responses *res;
-	struct cmsghdr *cmsg;
-	cap_rights_t rights;
-	struct msghdr msg;
-	struct iovec iov;
-	ssize_t nrecv;
-	pid_t pid;
+	int fd;
 
-	if (socketpair(PF_UNIX, SOCK_DGRAM, 0, fdpair)) {
-		perror("socketpair");
-		exit(1);
+	response = calloc(1, sizeof(*response));
+	if (response == NULL)
+		return (CB_TERMINATE);
+
+	fd = socket(request->r_payload.u_open_socket.r_domain,
+	    request->r_payload.u_open_socket.r_type,
+	    request->r_payload.u_open_socket.r_protocol);
+
+	if (fd != -1 &&
+	    (request->r_payload.u_open_socket.r_features & F_FEATURE_CAP)) {
+		cap_rights_limit(fd,
+		    &(request->r_payload.u_open_socket.r_rights));
 	}
 
-	pid = fork();
-	switch (pid) {
-	case -1:
-		perror("fork");
-		exit(1);
-	case 0:
-		badf = open("/dev/null", O_RDONLY);
-		close(fdpair[0]);
-		fd = fdpair[1];
-		daemon(0, 1);
+	if (fd == -1) {
+		fd = badf;
+		response->r_code = ERROR_FAIL;
+		response->r_errno = errno;
+	}
+
+	uuidgen(&(response->r_uuid), 1);
+	res = add_response(fd, response);
+	if (res == NULL) {
+		close(fd);
+		memset(response, 0, sizeof(*response));
+		free(response);
+		return (CB_TERMINATE);
+	}
+
+	send_file_descriptor(commfd, res);
+
+	return (CB_TERMINATE);
+}
+
+static callback_result
+do_connect(int fd, struct request *request)
+{
+	struct response res;
+	struct responses *r;
+	struct sockaddr *p;
+	int conres;
+
+	conres = -1;
+
+	memset(&res, 0, sizeof(res));
+
+	r = lookup_response(&(request->r_payload.u_connect.r_uuid));
+	if (r == NULL)
+		goto err;
+
+	/* XXX Yeah, this sucks horribly */
+	switch (request->r_payload.u_connect.r_socklen) {
+	case sizeof(struct sockaddr_in):
+		conres = connect(r->fd,
+		    (const struct sockaddr *)(&(request->r_payload.u_connect.r_sock.addr4)),
+		    request->r_payload.u_connect.r_socklen);
+		break;
+	case sizeof(struct sockaddr_in6):
+		conres = connect(r->fd,
+		    (const struct sockaddr *)(&(request->r_payload.u_connect.r_sock.addr6)),
+		    request->r_payload.u_connect.r_socklen);
 		break;
 	default:
-		childpid = pid;
-		cap_rights_init(&rights, CAP_READ, CAP_WRITE);
-		backend_fd = fdpair[0];
-		cap_rights_limit(backend_fd, &rights);
-		close(fdpair[1]);
-		return;
+		break;
 	}
 
-	while (1) {
-		memset(&request, 0, sizeof(request));
-		memset(&response, 0, sizeof(response));
-		memset(&iov, 0, sizeof(iov));
-		memset(&msg, 0, sizeof(msg));
-		memset(&control, 0, sizeof(control));
-
-		nrecv = recv(fd, &request, sizeof(request), 0);
-		if (nrecv < 0) {
-			perror("recv");
-			close(fd);
-			_exit(1);
-		}
-
-		switch (request.r_type) {
-		case ADD_FILE_PATH:
-			res = do_open(&request);
-			break;
-		case CREATE_SOCKET:
-			res = do_socket_create(&request);
-			break;
-		case CONNECT_SOCKET:
-			responsep = do_connect(&request);
-			break;
-		case CLOSE_FD:
-			close_resource(&(request.r_payload.u_close_fd.r_uuid));
-			break;
-		case UNLINK_PATH:
-			responsep = do_unlink_path(&request);
-			break;
-		case SHUTDOWN:
-			close(fd);
-			_exit(0);
-		case GETADDRINFO:
-			do_getaddrinfo(fd, &request);
-			break;
-		}
-
-		if (request.r_type == CLOSE_FD ||
-		    request.r_type == GETADDRINFO)
-			continue;
-
-		if (request.r_type == CONNECT_SOCKET) {
-			if (res == NULL)
-				continue;
-
-			send(fd, responsep, sizeof(*responsep), 0);
-			free(responsep);
-			continue;
-		}
-
-		if (request.r_type == UNLINK_PATH) {
-			if (responsep == NULL) {
-				/* XXX Ouch */
-				continue;
-			}
-
-			if (send(fd, responsep, sizeof(*responsep), 0) != sizeof(*responsep)) {
-				/* XXX Major ouch */
-				close(fd);
-				exit(0);
-			}
-
-			free(responsep);
-			continue;
-		}
-
-		if (res == NULL) {
-			memset(&response, 0, sizeof(response));
-			response.r_code = ERROR_FAIL;
-			response.r_errno = errno;
-			newfd = -1;
-		} else {
-			memmove(&response, res->response, sizeof(response));
-			newfd = res->fd;
-		}
-
-		iov.iov_base = &response;
-		iov.iov_len = sizeof(response);
-		msg.msg_iov = &iov;
-		msg.msg_iovlen = 1;
-		msg.msg_control = control;
-		msg.msg_controllen = sizeof(control);
-
-		cmsg = CMSG_FIRSTHDR(&msg);
-		cmsg->cmsg_level = SOL_SOCKET;
-		cmsg->cmsg_type = SCM_RIGHTS;
-		cmsg->cmsg_len = CMSG_LEN(sizeof(fd));
-		memmove(CMSG_DATA(cmsg), &newfd, sizeof(newfd));
-		msg.msg_controllen = cmsg->cmsg_len;
-
-		if (sendmsg(fd, &msg, 0) < 0) {
-			perror("sendmsg");
-			_exit(0);
-		}
+err:
+	if (conres == -1) {
+		res.r_code = ERROR_FAIL;
+		res.r_errno = EBADF;
 	}
 
+	send(fd, &res, sizeof(res), 0);
+
+	return (CB_TERMINATE);
+}
+
+static callback_result
+do_close(int fd, struct request *request)
+{
+	close_resource(&(request->r_payload.u_close_fd.r_uuid));
+	return (CB_TERMINATE);
+}
+
+static callback_result
+do_shutdown(int fd, struct request *request)
+{
+	close(fd);
 	_exit(0);
 }
